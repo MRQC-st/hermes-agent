@@ -1,0 +1,281 @@
+name: Fork desktop self-build
+
+# Self-hosted Windows desktop build for the fork.
+#
+# Upstream ships no GitHub Release binaries for Windows: the complete package is
+# a signed MSIX on their own R2 bucket, and it cannot carry a local patch. This
+# workflow builds the light desktop shell (the same variant the bootstrap
+# installs under apps/desktop/release/win-unpacked) from the patch branch, merges
+# upstream main first, and publishes a zip to this fork's Releases.
+#
+# It must also live on the fork's main branch: GitHub registers `schedule` and
+# `workflow_dispatch` only for workflows present on the default branch. The
+# checkout below always targets the patch branch, never main.
+
+on:
+  push:
+    branches: [patch/desktop-sandbox-marker-eperm]
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: Branch carrying the local patches
+        default: patch/desktop-sandbox-marker-eperm
+        type: string
+      skip_upstream_merge:
+        description: Build the branch as-is instead of merging upstream main first
+        default: false
+        type: boolean
+  # Every Monday 02:00 UTC = 10:00 Asia/Shanghai. GitHub drops scheduled runs on
+  # forks after 60 days without repository activity.
+  schedule:
+    - cron: '0 2 * * 1'
+
+permissions:
+  contents: write
+
+concurrency:
+  # One build at a time: two runs would race on the same release tag and on the
+  # merge push. Cancel-in-progress is false so a running build still publishes.
+  group: fork-desktop-selfbuild
+  cancel-in-progress: false
+
+env:
+  PATCH_BRANCH: patch/desktop-sandbox-marker-eperm
+  UPSTREAM_REPO: NousResearch/hermes-agent
+  # setup-pm requires an explicit install root; runner.temp is excluded from
+  # the workspace cache and is wiped with the job.
+  HERMES_HOME: ${{ runner.temp }}/hermes-home
+  HERMES_DESKTOP_VARIANT: light
+
+jobs:
+  windows-desktop:
+    name: Build light Windows desktop
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      # Long paths must be on before the checkout: pnpm's store paths under
+      # node_modules exceed the 260-character MAX_PATH on Windows, and electron
+      # packaging writes deep asar-unpacked trees.
+      - name: Enable long paths for this runner
+        shell: bash
+        run: |
+          git config --global core.longpaths true
+          # The runner has no Developer Mode, so symlinks in the tree would fail.
+          git config --global core.symlinks false
+
+      - name: Check out the patch branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.build_ref || 'patch/desktop-sandbox-marker-eperm' }}
+          # Full history and tags: the release tag is derived from `git describe`,
+          # and the merge needs real ancestry against upstream.
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge upstream main into the patch branch
+        id: merge
+        shell: bash
+        env:
+          SKIP_MERGE: ${{ inputs.skip_upstream_merge }}
+        run: |
+          set -euo pipefail
+          git config user.name 'hermes-fork-ci'
+          git config user.email 'hermes-fork-ci@users.noreply.github.com'
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+          upstream_sha="$(git rev-parse upstream/main)"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if [ "${SKIP_MERGE:-false}" = "true" ]; then
+            echo "merge=skipped" >> "$GITHUB_OUTPUT"
+            echo 'Upstream merge skipped by dispatch input.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if git merge --no-edit -m "merge: upstream main @ ${upstream_sha:0:8}" upstream/main > merge.log 2>&1; then
+            echo "merge=clean" >> "$GITHUB_OUTPUT"
+            cat merge.log
+            exit 0
+          fi
+
+          # Loud failure, never a silent continue: the patch no longer applies
+          # to upstream and a human has to rebase it.
+          git diff --name-only --diff-filter=U > merge-conflicts.txt || true
+          {
+            echo '### Upstream merge conflict'
+            echo
+            echo "Upstream commit: ${upstream_sha}"
+            echo
+            echo 'Conflicted paths:'
+            echo
+            sed 's/^/- `/' merge-conflicts.txt | sed 's/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Upstream merge conflict::$(tr '\n' ' ' < merge-conflicts.txt)"
+          cat merge.log
+          git merge --abort || true
+          exit 1
+
+      - name: Push the upstream merge back to the patch branch
+        # Best effort: a read-only token still builds (the merge stays
+        # ephemeral), it only cannot advance the branch. Never fail the build.
+        continue-on-error: true
+        shell: bash
+        if: steps.merge.outputs.merge == 'clean'
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${PATCH_BRANCH}"
+          echo "Branch advanced to $(git rev-parse --short HEAD)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record build identity
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          # `v0.23.0-209-g90d6b98` — the same grammar `hermes --version` prints
+          # (v0.23.0+209.g90d6b98), with the plus sign folded into a dash so the
+          # tag stays URL-safe in the Releases API.
+          describe="$(git describe --tags --long --exclude '*canary*' --exclude '*rc*' 2>/dev/null \
+            || git describe --tags --long 2>/dev/null || echo "v0.0.0-0-g${sha:0:8}")"
+          base="$(git describe --tags --abbrev=0 --exclude '*canary*' --exclude '*rc*' 2>/dev/null || echo v0.0.0)"
+          {
+            echo "sha=$sha"
+            echo "tag=selfbuild-${describe}"
+            echo "version=${describe}"
+            echo "base=${base}"
+            echo "patch_commits=$(git rev-list --count upstream/main..HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Build identity"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| built commit | \`${sha}\` |"
+            echo "| upstream main | \`$(git rev-parse upstream/main)\` |"
+            echo "| upstream merge | ${{ steps.merge.outputs.merge }} |"
+            echo "| release tag | \`selfbuild-${describe}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up the pinned toolchain (Python, Node, pnpm)
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          cache: true
+
+      - name: Exclude build paths from Defender scanning
+        continue-on-error: true
+        shell: powershell
+        run: |
+          foreach ($p in @($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP)) {
+            try { Add-MpPreference -ExclusionPath $p; Write-Host "Defender exclusion: $p" }
+            catch { Write-Host "Defender exclusion not applied for $p - continuing" }
+          }
+
+      - name: Build the Windows desktop (unpacked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --dir packages release/win-unpacked only: no MSIX, no installer, and
+          # no Azure Trusted Signing (the config warns and ships unsigned when
+          # the AZURE_SIGN_* variables are absent, which is the fork contract).
+          python scripts/bundles/desktop.py \
+            --commit "${{ steps.meta.outputs.sha }}" \
+            --variant light \
+            --work "$RUNNER_TEMP/desktop-job" \
+            --cache "$GITHUB_WORKSPACE/.cache/desktop-inputs" \
+            -- --dir
+
+      - name: Package the release asset
+        id: package
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:GITHUB_WORKSPACE 'apps\desktop\release\win-unpacked'
+          if (!(Test-Path (Join-Path $src 'Hermes.exe'))) { throw "win-unpacked is missing Hermes.exe" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $tag = '${{ steps.meta.outputs.tag }}'
+          $name = "Hermes-light-win-x64-$tag.zip"
+          $out = Join-Path 'dist' $name
+
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (Test-Path $sevenZip) {
+            & $sevenZip a -tzip -mx=5 $out "$src\*" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7z failed with exit code $LASTEXITCODE" }
+          } else {
+            Compress-Archive -Path "$src\*" -DestinationPath $out -CompressionLevel Optimal
+          }
+
+          $size = (Get-Item $out).Length
+          # GitHub caps a single release asset at 2 GiB.
+          if ($size -gt 2147483648) {
+            throw "$name is $([math]::Round($size/1GB,2)) GiB; over the 2 GiB release-asset cap. Split it or publish elsewhere."
+          }
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Set-Content -Encoding ascii (Join-Path 'dist' 'SHA256SUMS.txt')
+
+          "asset_name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "asset_bytes=$size" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "asset_sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "| asset | size | sha256 |" >> $env:GITHUB_STEP_SUMMARY
+          "|---|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          "| ``$name`` | $([math]::Round($size/1MB,1)) MB | ``$hash`` |" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag='${{ steps.meta.outputs.tag }}'
+          asset='${{ steps.package.outputs.asset_name }}'
+          upstream_sha='${{ steps.merge.outputs.upstream_sha }}'
+          built_sha='${{ steps.meta.outputs.sha }}'
+
+          cat > notes.md <<EOF
+          Self-built Windows desktop shell (light variant) for this fork.
+
+          - Built commit: \`${built_sha}\`
+          - Upstream main merged: \`${upstream_sha}\`
+          - Variant: light (shell only; pair it with the Hermes CLI install)
+          - Artifact: \`${asset}\` (${{ steps.package.outputs.asset_bytes }} bytes)
+          - SHA256: \`${{ steps.package.outputs.asset_sha256 }}\`
+          - Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Local patches carried on top of upstream:
+
+              $(git log --oneline upstream/main..HEAD | sed 's/^/    /')
+
+          Unsigned: no Authenticode certificate is attached, so Windows
+          SmartScreen warns on first launch. Verify the checksum, then use
+          "More info -> Run anyway", or unblock the exe with
+          \`Unblock-File .\\Hermes.exe\`.
+
+          Install scope: extract over
+          %LOCALAPPDATA%\\hermes\\hermes-agent\\apps\\desktop\\release\\win-unpacked.
+          Use tools\\update-desktop-from-fork.ps1 for backup, verify and rollback.
+          EOF
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "dist/${asset}" dist/SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "dist/${asset}" dist/SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$built_sha" \
+              --title "Hermes self-build ${{ steps.meta.outputs.version }}" \
+              --notes-file notes.md
+          fi
+          echo "Release $tag published: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${tag}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload workflow artifact (short retention)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-light-win-x64-${{ github.run_id }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+            merge.log
+            merge-conflicts.txt
+          if-no-files-found: warn
+          retention-days: 7
