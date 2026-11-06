@@ -177,6 +177,7 @@ export function writeSandboxMarker(
   } catch {
     return
   }
+
   try {
     writeFileSync(sandboxMarkerPath(dir), `${JSON.stringify(marker)}\n`, 'utf8')
   } catch {
