@@ -95,15 +95,17 @@ jobs:
             exit 0
           fi
 
-          if git merge --no-edit -m "merge: upstream main @ ${upstream_sha:0:8}" upstream/main > merge.log 2>&1; then
+          if git merge --no-edit -m "merge: upstream main @ ${upstream_sha:0:8}" upstream/main > "$RUNNER_TEMP/merge.log" 2>&1; then
             echo "merge=clean" >> "$GITHUB_OUTPUT"
-            cat merge.log
+            cat "$RUNNER_TEMP/merge.log"
             exit 0
           fi
 
           # Loud failure, never a silent continue: the patch no longer applies
           # to upstream and a human has to rebase it.
-          git diff --name-only --diff-filter=U > merge-conflicts.txt || true
+          # Logs live under RUNNER_TEMP: an untracked file in the workspace makes
+          # the desktop build's clean-checkout assertion fail before it compiles.
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/merge-conflicts.txt" || true
           {
             echo '### Upstream merge conflict'
             echo
@@ -111,10 +113,10 @@ jobs:
             echo
             echo 'Conflicted paths:'
             echo
-            sed 's/^/- `/' merge-conflicts.txt | sed 's/$/`/'
+            sed 's/^/- `/' "$RUNNER_TEMP/merge-conflicts.txt" | sed 's/$/`/'
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::error title=Upstream merge conflict::$(tr '\n' ' ' < merge-conflicts.txt)"
-          cat merge.log
+          echo "::error title=Upstream merge conflict::$(tr '\n' ' ' < "$RUNNER_TEMP/merge-conflicts.txt")"
+          cat "$RUNNER_TEMP/merge.log"
           git merge --abort || true
           exit 1
 
@@ -278,7 +280,7 @@ jobs:
           path: |
             dist/*.zip
             dist/SHA256SUMS.txt
-            merge.log
-            merge-conflicts.txt
+            ${{ runner.temp }}/merge.log
+            ${{ runner.temp }}/merge-conflicts.txt
           if-no-files-found: warn
           retention-days: 7
