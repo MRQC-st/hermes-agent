@@ -167,8 +167,21 @@ export function writeSandboxMarker(
     return
   }
 
-  mkdirSync(dir, { recursive: true })
-  writeFileSync(sandboxMarkerPath(dir), `${JSON.stringify(marker)}\n`, 'utf8')
+  // Best-effort, silent: the marker is advisory (boot-abort / fallback
+  // detection). A transient EPERM — AV, snapshotting, or another process
+  // briefly holding the file — must never surface as an uncaught exception
+  // during `app.whenReady()`; see #38216 and field reports of
+  // `windows-sandbox-fallback.json` EPERM on AppData\Roaming\Hermes.
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {
+    return
+  }
+  try {
+    writeFileSync(sandboxMarkerPath(dir), `${JSON.stringify(marker)}\n`, 'utf8')
+  } catch {
+    // swallow — marker update is non-critical
+  }
 }
 
 export interface SandboxLaunchDecision {
