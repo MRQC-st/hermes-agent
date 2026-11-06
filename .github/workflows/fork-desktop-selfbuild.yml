@@ -4,9 +4,9 @@ name: Fork desktop self-build
 #
 # Upstream ships no GitHub Release binaries for Windows: the complete package is
 # a signed MSIX on their own R2 bucket, and it cannot carry a local patch. This
-# workflow builds the light desktop shell (the same variant the bootstrap
-# installs under apps/desktop/release/win-unpacked) from the patch branch, merges
-# upstream main first, and publishes a zip to this fork's Releases.
+# workflow rebuilds the same unpacked desktop shell the bootstrap installs under
+# apps/desktop/release/win-unpacked, merges upstream main first, and publishes a
+# zip to this fork's Releases.
 #
 # It must also live on the fork's main branch: GitHub registers `schedule` and
 # `workflow_dispatch` only for workflows present on the default branch. The
@@ -42,11 +42,10 @@ concurrency:
 env:
   PATCH_BRANCH: patch/desktop-sandbox-marker-eperm
   UPSTREAM_REPO: NousResearch/hermes-agent
-  HERMES_DESKTOP_VARIANT: light
 
 jobs:
   windows-desktop:
-    name: Build light Windows desktop
+    name: Build Windows desktop shell
     runs-on: windows-latest
     timeout-minutes: 180
     env:
@@ -176,19 +175,27 @@ jobs:
             catch { Write-Host "Defender exclusion not applied for $p - continuing" }
           }
 
-      - name: Build the Windows desktop (unpacked)
+      - name: Install workspace dependencies
         shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the Windows desktop shell
+        shell: bash
+        working-directory: apps/desktop
         run: |
           set -euo pipefail
-          # --dir packages release/win-unpacked only: no MSIX, no installer, and
-          # no Azure Trusted Signing (the config warns and ships unsigned when
-          # the AZURE_SIGN_* variables are absent, which is the fork contract).
-          python scripts/bundles/desktop.py \
-            --commit "${{ steps.meta.outputs.sha }}" \
-            --variant light \
-            --work "$RUNNER_TEMP/desktop-job" \
-            --cache "$GITHUB_WORKSPACE/.cache/desktop-inputs" \
-            -- --dir
+          # `pack` is the exact local path the bootstrap uses:
+          # scripts/build.mjs (stamp + native deps + main/renderer compile)
+          # followed by `run-electron-builder.mjs --dir`, which packages only
+          # release/win-unpacked. No MSIX, no installer.
+          #
+          # Do NOT use scripts/bundles/desktop.py here: it forces a variant
+          # ('light'/'bundled'/'store'), and a variant names the binary
+          # hermes-light-<sha>.exe. hermes_cli/main_desktop.py only launches
+          # win-unpacked\Hermes.exe, so a variant build is not installable.
+          # The unset-variant source build yields displayName "Hermes" and is
+          # what the bootstrap install already contains.
+          pnpm run pack
 
       - name: Package the release asset
         id: package
@@ -199,7 +206,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
           $tag = '${{ steps.meta.outputs.tag }}'
-          $name = "Hermes-light-win-x64-$tag.zip"
+          $name = "Hermes-win-x64-$tag.zip"
           $out = Join-Path 'dist' $name
 
           $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
@@ -237,11 +244,11 @@ jobs:
           built_sha='${{ steps.meta.outputs.sha }}'
 
           cat > notes.md <<EOF
-          Self-built Windows desktop shell (light variant) for this fork.
+          Self-built Windows desktop shell for this fork.
 
           - Built commit: \`${built_sha}\`
           - Upstream main merged: \`${upstream_sha}\`
-          - Variant: light (shell only; pair it with the Hermes CLI install)
+          - Contents: unpacked win-unpacked (Hermes.exe + app.asar), no bundled agent payload
           - Artifact: \`${asset}\` (${{ steps.package.outputs.asset_bytes }} bytes)
           - SHA256: \`${{ steps.package.outputs.asset_sha256 }}\`
           - Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -276,7 +283,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: hermes-light-win-x64-${{ github.run_id }}
+          name: hermes-win-x64-${{ github.run_id }}
           path: |
             dist/*.zip
             dist/SHA256SUMS.txt
