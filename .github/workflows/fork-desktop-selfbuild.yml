@@ -50,10 +50,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 180
     env:
-      # setup-pm requires an explicit install root; runner.temp is excluded from
-      # the workspace cache and is wiped with the job. (The runner context is
-      # only available inside a job, not in a workflow-level env block.)
-      HERMES_HOME: ${{ runner.temp }}/hermes-home
+      # setup-pm requires an explicit install root. The `runner` context is not
+      # available in a job-level env block, and .cache is already gitignored
+      # (upstream keeps .cache/desktop-inputs there), so the toolchain lives
+      # beside the build caches instead of under runner.temp.
+      HERMES_HOME: ${{ github.workspace }}/.cache/hermes-home
     steps:
       # Long paths must be on before the checkout: pnpm's store paths under
       # node_modules exceed the 260-character MAX_PATH on Windows, and electron
